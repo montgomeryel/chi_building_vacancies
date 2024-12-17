@@ -1,0 +1,580 @@
+---
+title: "Data"
+author: 
+date: 
+format: 
+  pdf:
+    include-in-header: 
+       text: |
+         \usepackage{fvextra}
+         \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+include-before-body:
+  text: |
+    \RecustomVerbatimEnvironment{verbatim}{Verbatim}{
+      showspaces = false,
+      showtabs = false,
+      breaksymbolleft={},
+      breaklines
+    }
+output:
+  echo: false
+  eval: false
+---
+
+
+### Census API pull
+This step uses the .acs5.get() function to pull the relevant tables from the US Census API/
+
+```{python}
+import os
+import pandas as pd
+import requests
+from census import Census
+from us import states
+import json
+import geopandas as gpd
+
+```
+
+### Set Directory
+
+```{python}
+# Define the output directory and file names
+directory = r'C:\Users\EM\Documents\GitHub\chi_building_vacancies'
+```
+```{python}
+# Initialize the Census API with your API key
+census_key = "28685c677403ed1719764eb8ba7a6087d00544fb"
+c = Census(census_key)
+
+file_name = os.path.join(directory, "B25075_raw.csv")
+crosswalk_url = "https://www2.census.gov/geo/docs/maps-data/data/rel/zcta_tract_rel_10.txt"
+crosswalk_file = os.path.join(directory, "zcta_tract_cross_walk_2010_census.csv")
+
+# Check if the Census API data file already exists
+if os.path.exists(file_name+'1'):
+    print("Census data file already exists. Skipping API call.")
+    combined_data = pd.read_csv(file_name)
+else:
+    variables = (
+        [f"B25075_{str(i).zfill(3)}E" for i in range(1, 26)] +  # Property value variable
+        ["B25004_008E"] +  # Vacancy variable
+        [f"B19001_{str(i).zfill(3)}E" for i in range(1, 18)]  # Income variables
+    )    
+    county_code = "031"  # Cook County
+    state_code = "17"  # Illinois
+    years = range(2010, 2023)
+    all_data = []
+
+    for year in years:
+        print(f"Fetching Census data for year {year}...")
+        data = c.acs5.state_county_tract(
+            fields=["NAME"] + variables,
+            state_fips=state_code,
+            county_fips=county_code,
+            tract="*",
+            year=year
+        )
+        
+        df = pd.DataFrame(data)
+        print(f"Year {year} columns: {df.columns}")
+        df['year'] = year
+        all_data.append(df)
+
+    # Combine all data into a single DataFrame
+    combined_data = pd.concat(all_data, ignore_index=True)
+    combined_data.to_csv(file_name, index=False)
+    print(f"Census data saved to {file_name}.")
+
+# Check if the crosswalk file already exists
+if os.path.exists(crosswalk_file):
+    print("Crosswalk file already exists. Skipping download.")
+else:
+    print("Downloading crosswalk file...")
+    crosswalk_raw = pd.read_csv(crosswalk_url, delimiter=',', dtype=str)
+    crosswalk_raw.to_csv(crosswalk_file, index=False)
+    print(f"Crosswalk file saved to {crosswalk_file}.")
+```
+```{python}
+# Load the crosswalk file
+dtype_dict={'TRACT':str}
+crosswalk_raw = pd.read_csv(crosswalk_file, dtype=dtype_dict)
+crosswalk_raw["tract"] = crosswalk_raw["TRACT"].astype(str)
+crosswalk_merge = crosswalk_raw[["tract", "ZCTA5"]]
+```
+
+```{python}
+crosswalk_merge.dtypes
+```
+```{python}
+# Merge combined data with the crosswalk
+prices_income_vacancy = combined_data.astype({'tract': 'str'}).merge(
+    crosswalk_merge, 
+    how='left', 
+    on='tract'
+)
+```
+```{python}
+# Save the final merged DataFrame to a new CSV
+output_file = os.path.join(directory, "prices_income_vacancy.csv")
+prices_income_vacancy.to_csv(output_file, index=False)
+```
+
+```{python}
+hmm=prices_income_vacancy[prices_income_vacancy['ZCTA5'].isna()]
+```
+```{python}
+# Column names
+metadata_file = os.path.join(directory, "col_names.json")
+metadata_url = "https://api.census.gov/data/2020/acs/acs5/variables"
+
+# Check if metadata file exists locally
+if os.path.exists(metadata_file):
+    print("Metadata file exists. Loading from local file...")
+    with open(metadata_file, "r") as f:
+        metadata = json.load(f)
+else:
+    print("Metadata file does not exist. Fetching from API...")
+    response = requests.get(metadata_url)
+    metadata = response.json()
+
+    # Save metadata to a local file for future use
+    with open(metadata_file, "w") as f:
+        json.dump(metadata, f)
+    print(f"Metadata saved to {metadata_file}.")
+
+# Extract headers and data
+headers = metadata[0]  # ['name', 'label', 'concept']
+data = metadata[1:]    # Remaining rows
+
+# Define relevant table prefixes and specific variables to filter
+value_income_prefixes = ["B25075_", "B19001_"]
+vacancy_variable = ["B25004_008E"]
+
+# Filter metadata for relevant variables
+filtered_data = [
+    row for row in data
+    if any(row[0].startswith(prefix) for prefix in value_income_prefixes) or row[0] in vacancy_variable
+]
+
+# Create a dictionary with 'name' as the key and 'label' as the value
+metadata_dict = {row[0]: row[1] for row in filtered_data}
+
+
+# Function to make names easier to read
+def custom_column_renamer(column_name, metadata_dict):
+    if column_name.startswith("B25075_"):
+        return f"Home Value {metadata_dict.get(column_name, column_name)}"
+    elif column_name.startswith("B19001_"):
+        return f"Household Income {metadata_dict.get(column_name, column_name)}"
+    elif column_name == "B25004_008E":
+        return "Number of Vacant Units"
+    else:
+        return metadata_dict.get(column_name, column_name)
+
+# Rename columns
+census_df = pd.read_csv(directory + r"/prices_income_vacancy.csv")
+census_df.rename(columns=lambda col: custom_column_renamer(col, metadata_dict), inplace=True)
+census_df.columns = census_df.columns.str.replace("!!", " ", regex=False)
+```
+
+
+```{python}
+crosswalk_raw.columns
+```
+```{python}
+# Chicago Community Areas
+csv_file = os.path.join(directory, "community_areas_raw.csv")
+csv_url = "https://data.cityofchicago.org/api/views/igwz-8jzy/rows.csv?date=20241125&accessType=DOWNLOAD"
+
+# Check if the CSV file exists locally
+if not os.path.exists(csv_file):
+    print("CSV file does not exist locally. Downloading...")
+    response = requests.get(csv_url)
+    response.raise_for_status() 
+    with open(csv_file, "wb") as f:
+        f.write(response.content)
+    print(f"CSV file downloaded and saved to {csv_file}.")
+
+# Load the CSV file into a DataFrame
+community_areas = pd.read_csv(csv_file)
+```
+
+### City of Chicago Vacant Lot API Pull
+ 
+This section grabs data from [this](https://data.cityofchicago.org/resource/kc9i-wq85.csv) city of Chicago source.
+
+```{python}
+# make sure to install this package before running:
+# pip install sodapy
+from sodapy import Socrata
+
+client = Socrata("data.cityofchicago.org", None)
+
+# Hard coded total rows (5004), as results are limited at 1000 per query.
+# Returned as JSON from API / converted to Python list of dictionaries by sodapy.
+results = client.get("kc9i-wq85", limit=5004)
+
+# Convert to pandas DataFrame
+vacant_df = pd.DataFrame.from_records(results)
+vacant_df.to_csv('vacant.csv') 
+```
+
+
+### Checkpoint; data has been acquired
+
+
+```{python}
+vacancy_data = pd.read_csv(directory + r"\vacant.csv")
+```
+
+
+```{python}
+from shapely.geometry import shape
+client = Socrata("data.cityofchicago.org", None )
+
+results=client.get('74p9-q2aq', format='geojson')
+results_df = pd.json_normalize(results)
+
+# install geojson if you do not already have it
+if 'the_geom.type' in results_df.columns and 'the_geom.coordinates' in results_df.columns:
+        # Create geometry column using shapely
+        results_df['geometry'] = results_df.apply(lambda row: shape({
+            'type': row['the_geom.type'],
+            'coordinates': row['the_geom.coordinates']
+        }), axis=1)
+
+# Optionally, you can normalize the features into a DataFrame
+# This will flatten the structure and allow you to work with the properties and geometry
+
+```
+
+```{python}
+geo_data=gpd.GeoDataFrame(results_df, geometry='geometry')
+
+# saving the gdf for later use
+geo_data.to_file("census_tract_geo_data.shp")
+
+#set coordinate ref system
+geo_data.set_crs(epsg=4326, inplace=True)
+
+```
+
+```{python}
+#download the data from https://data.cityofchicago.org/Facilities-Geographic-Boundaries/CensusTractsTIGER2010/74p9-q2aq/about_data
+#Use the export button in the top righthand corner to download as a shapefile
+
+geo_data=gpd.read_file(directory + r"\geo_export_babed850-df6f-42f1-a951-f174092d5ba8.shp")
+
+
+```
+
+
+```{python}
+geo_data.head()
+```
+
+
+```{python}
+#allign names for census_data and geo_data
+census_df['NAME']=census_df['NAME'].str.replace(", Cook County, Illinois", "")
+
+```
+
+```{python}
+merged_census_and_geo=census_df.merge(geo_data, left_on='NAME', right_on='namelsad10', how='left')
+merged_census_and_geo=gpd.GeoDataFrame(merged_census_and_geo, geometry='geometry')
+merged_census_and_geo.head()
+```
+
+### Plotting Data
+Vacant lot write-ups per year
+```{python}
+import altair as alt
+
+vacancy_data['issued_date'] = pd.to_datetime(vacancy_data['issued_date'])
+
+vacancy_data['year'] = vacancy_data['issued_date'].dt.year
+
+#count the number of violations per year
+violations_per_year = vacancy_data.groupby('year').size().reset_index(name='count')
+
+line_chart = alt.Chart(violations_per_year).mark_line().encode(
+    x=alt.X('year:O', scale=alt.Scale(domain=list(range(2011, violations_per_year['year'].max() + 1)))),
+    y='count:Q'
+).properties(
+    title='Count of Vacancy Reports per Year'
+)
+# $pip install vl-convert-python
+line_chart.save(directory + 'line_chart.png')
+
+```
+
+Here we will test our geo data
+
+```{python}
+import matplotlib.pyplot as plt
+from shapely.geometry import Point
+
+# Filter out rows with missing coordinates 
+vacancy_data = vacancy_data.dropna(subset=['longitude', 'latitude'])
+
+#create a geometry column from the coordinates
+vacancy_data['geometry'] = vacancy_data.apply(lambda row: Point(row['longitude'], row['latitude']), axis=1)
+
+#transform vacancy location column into readable geographic data
+vacancy_gdf = gpd.GeoDataFrame(vacancy_data, geometry='geometry')
+
+# saving the gdf for later use
+vacancy_gdf.to_file("vacant_gdf.shp")
+
+#set coordinate ref system
+vacancy_gdf.set_crs(epsg=4326, inplace=True) 
+
+#plot tracts and points; used gen AI for simple plot
+
+fig, ax = plt.subplots(figsize=(10, 10))
+
+# Plot the city tracts
+geo_data.plot(ax=ax, color='white', edgecolor='black')
+
+# Plot the points
+vacancy_gdf.plot(ax=ax, color='red', markersize=5)
+
+plt.show()
+
+```
+
+```{python}
+merged_census_and_geo.columns[2:26]
+
+```
+
+### Housing Price Choropleth 
+```{python}
+ def ave_price(row):
+    # Multiplying values from columns based on the row
+    calc_1 = row['Home Value Estimate Total: Less than $10,000'] * ((0+9999)/2)
+    calc_2 = row['Home Value Estimate Total: $10,000 to $14,999'] * ((10000+14999)/2)
+    calc_3 = row[merged_census_and_geo.columns[4]] * ((15000 +19999)/2)
+    calc_4 = row[merged_census_and_geo.columns[5]] * ((20000+24999)/2)
+    calc_5 = row[merged_census_and_geo.columns[6]] * ((25000+29999)/2)
+    calc_6 = row[merged_census_and_geo.columns[7]] * ((30000+34999)/2)
+    calc_7 = row[merged_census_and_geo.columns[8]] * ((35000+39999)/2)
+    calc_8 = row[merged_census_and_geo.columns[9]] * ((40000+49999)/2)
+    calc_9 = row[merged_census_and_geo.columns[10]] * ((50000+59999)/2)
+    calc_10 = row[merged_census_and_geo.columns[11]] * ((60000+69999)/2)
+    calc_11 = row[merged_census_and_geo.columns[12]] * ((70000+79999)/2)
+    calc_12 = row[merged_census_and_geo.columns[13]] * ((80000+89999)/2)
+    calc_13 = row[merged_census_and_geo.columns[14]] * ((90000+99999)/2)
+    calc_14 = row[merged_census_and_geo.columns[15]] * ((100000+124999)/2)
+    calc_15 = row[merged_census_and_geo.columns[16]] * ((125000+149999)/2)
+    calc_16 = row[merged_census_and_geo.columns[17]] * ((150000+174999)/2)
+    calc_17 = row[merged_census_and_geo.columns[18]] * ((175000+199999)/2)
+    calc_18 = row[merged_census_and_geo.columns[19]] * ((200000+249999)/2)
+    calc_19 = row[merged_census_and_geo.columns[20]] * ((250000+299999)/2)
+    calc_20 = row[merged_census_and_geo.columns[21]] * ((300000+399999)/2)
+    calc_21 = row[merged_census_and_geo.columns[22]] * ((400000+499999)/2)
+    calc_22 = row[merged_census_and_geo.columns[23]] * ((500000+749999)/2)
+    calc_23 = row[merged_census_and_geo.columns[24]] * ((75000+999999)/2)
+    calc_24 = row[merged_census_and_geo.columns[25]] * ((1000000+1499999)/2)
+    
+
+    numerator = (calc_1 + calc_2 + calc_3 + calc_4 + calc_5 + calc_6 +
+                 calc_7 + calc_8 + calc_9 + calc_10 + calc_11 + calc_12 +
+                 calc_13 + calc_14 + calc_15 + calc_16 + calc_17 + calc_18 +
+                 calc_19 + calc_20 + calc_21 + calc_22 + calc_23 + calc_24
+                 )
+
+    if row['Home Value Estimate Total:']==0:
+      average=0
+    else:
+      denominator = row['Home Value Estimate Total:']
+      average = numerator / denominator
+    return average
+
+
+# Apply the function to each row of the DataFrame
+merged_census_and_geo['average_price'] = merged_census_and_geo.apply(ave_price, axis=1)
+
+ ```
+ 
+
+Create plot
+```{python}
+merged_census_and_geo['average_price']=merged_census_and_geo['average_price'].fillna(0)
+# excluding prices over $999,999
+import matplotlib.colors as mcolors
+norm=mcolors.Normalize(vmin=merged_census_and_geo['average_price'].min(), vmax=999999)
+
+fig, ax = plt.subplots(figsize=(10, 10))
+
+# Plot the city tracts
+merged_census_and_geo.plot(ax=ax, column='average_price', edgecolor='black', legend=True, cmap='Greens', norm=norm).set_axis_off()
+
+#Plot the points
+vacancy_gdf.plot(ax=ax, color='red', markersize=5, marker='o', label='Vacant Lots')
+ax.legend(loc='lower left')
+plt.title('Average Housing Price by Census Tract with Vacant Lots')
+
+#export map
+plt.savefig(directory + '/tract_value.png')
+
+plt.show()
+```
+
+### Household Income Maps 
+
+
+```{python}
+merged_census_and_geo.columns[27:44]
+```
+
+```{python}
+def ave_income(row):
+    # Multiplying values from columns based on the row
+    calc_1 = row[merged_census_and_geo.columns[28]] * ((0+9999)/2)
+    calc_2 = row[merged_census_and_geo.columns[29]] * ((10000+14999)/2)
+    calc_3 = row[merged_census_and_geo.columns[30]] * ((15000 +19999)/2)
+    calc_4 = row[merged_census_and_geo.columns[31]] * ((20000+24999)/2)
+    calc_5 = row[merged_census_and_geo.columns[32]] * ((25000+29999)/2)
+    calc_6 = row[merged_census_and_geo.columns[33]] * ((30000+34999)/2)
+    calc_7 = row[merged_census_and_geo.columns[34]] * ((35000+39999)/2)
+    calc_8 = row[merged_census_and_geo.columns[35]] * ((40000+44999)/2)
+    calc_9 = row[merged_census_and_geo.columns[36]] * ((45000+49999)/2)
+    calc_10 = row[merged_census_and_geo.columns[37]] * ((50000+59999)/2)
+    calc_11 = row[merged_census_and_geo.columns[38]] * ((60000+74999)/2)
+    calc_12 = row[merged_census_and_geo.columns[39]] * ((75000+99999)/2)
+    calc_13 = row[merged_census_and_geo.columns[40]] * ((100000+124999)/2)
+    calc_14 = row[merged_census_and_geo.columns[41]] * ((125000+14999)/2)
+    calc_15 = row[merged_census_and_geo.columns[42]] * ((150000+199999)/2)
+    calc_16 = row[merged_census_and_geo.columns[43]] * ((200000+1000000)/2)
+    
+    
+
+    numerator = (calc_1 + calc_2 + calc_3 + calc_4 + calc_5 + calc_6 +
+                 calc_7 + calc_8 + calc_9 + calc_10 + calc_11 + calc_12 +
+                 calc_13 + calc_14 + calc_15 + calc_16)
+
+    if row['Household Income Estimate Total:']==0:
+      average=0
+    else:
+      denominator = row['Household Income Estimate Total:']
+      average = numerator / denominator
+    return average
+
+
+# Apply the function to each row of the DataFrame
+merged_census_and_geo['average_income'] = merged_census_and_geo.apply(ave_income, axis=1)
+```
+
+
+```{python}
+#creating average household income by census tract map
+# excluding incomes over 199,999
+import matplotlib.colors as mcolors
+norm=mcolors.Normalize(vmin=merged_census_and_geo['average_price'].min(), vmax=199999)
+
+fig, ax = plt.subplots(figsize=(10, 10))
+
+# Plot the city tracts
+merged_census_and_geo.plot(ax=ax, column='average_income', edgecolor='black', legend=True, norm=norm, cmap='Greens').set_axis_off()
+
+#Plot the points
+vacancy_gdf.plot(ax=ax, color='red', markersize=5, marker='o', label='Vacant Lots')
+plt.title('Average Household Income by Census Tract with Vacant Lots')
+ax.legend(loc='lower left')
+
+#export map
+plt.savefig(directory + '/tract_income.png')
+
+plt.show()
+```
+
+### ZCTA
+```{python}
+merged_census_and_geo['geometry']=merged_census_and_geo['geometry'].make_valid()
+```
+
+```{python}
+dissolved = merged_census_and_geo[['ZCTA5', 'geometry', 'average_price', 'average_income']].dissolve(by="ZCTA5", aggfunc="mean")
+
+dissolved = dissolved.reset_index()
+
+```
+
+```{python}
+merged_zctas=merged_census_and_geo['ZCTA5'].unique()
+dissolved_zctas=dissolved['ZCTA5'].unique()
+
+for x in merged_zctas:
+    if x not in dissolved_zctas:
+        print(f'{x} not in dissolved')
+
+```
+
+```{python}
+merged_census_and_geo.columns
+```
+```{python}
+merged_na_zctas = merged_census_and_geo[merged_census_and_geo['ZCTA5']==0]
+
+na_zcta_tracts=merged_na_zctas['tractce10'].unique()
+na_zcta_tracts[0:14]
+```
+
+```{python}
+census_na_zctas=census_df[census_df['ZCTA5'].isna()]
+```
+```{python}
+merged_na_zctas.plot()
+```
+```{python}
+#create avg household income map by ZCTA5
+fig, ax = plt.subplots(figsize=(10, 10))
+
+merged_census_and_geo.plot(ax=ax, facecolor='white', edgecolor='gray')
+
+# Plot the city tracts
+dissolved.plot(ax=ax, column='average_income', legend=True, edgecolor='black',cmap='Greens').set_axis_off()
+
+
+#Plot the points
+vacancy_gdf.plot(ax=ax, color='red', markersize=5,marker='o', label='Vacant Lots')
+plt.title('Average Household Income by ZCTA5 with Vacant Lots')
+ax.legend(loc='lower left')
+#export map
+plt.savefig(directory + '/zcta_income.png')
+
+plt.show()
+
+
+
+```
+
+```{python}
+#create avg home value map by ZCTA5
+fig, ax = plt.subplots(figsize=(10, 10))
+
+# Plot the city tracts
+dissolved.plot(ax=ax, column='average_price', legend=True, edgecolor='black',cmap='Greens').set_axis_off()
+
+
+#Plot the points
+vacancy_gdf.plot(ax=ax, color='red', markersize=5,marker='o', label='Vacant Lots')
+plt.title('Average Housing Price by ZCTA5 with Vacant Lots')
+ax.legend(loc='lower left')
+#export map
+plt.savefig(directory + '/zcta_value.png')
+
+plt.show()
+```
+
+### Shiny Maps
+
+```{python}
+# tab 1:
+# show 4 different maps by toggling area measure (zcta/tract) and centered wealth measure (housing price/median income)
+# tab 2: 
+# interactive map that shows reported vacant lots for each year. Click on point to get street address.
+```
